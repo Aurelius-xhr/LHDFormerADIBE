@@ -47,10 +47,12 @@ sh main.sh
 ## Cite our work
 ```bibtex
 @inproceedings{xue2025adaptive,
-  title = {Adaptive Embedding for Long-Range High-Order Dependencies via Time-Varying Transformer on fMRI},
-  author = {Xue, Rundong and Han, Xiangmin and Hu, Hao and Zhang, Zeyu and Du, Shaoyi and Gao, Yue},
-  booktitle = {International Conference on Medical Image Computing and Computer-Assisted Intervention},
-  year = {2025},
+  title={Adaptive Embedding for Long-Range High-Order Dependencies via Time-Varying Transformer on fMRI},
+  author={Xue, Rundong and Han, Xiangmin and Hu, Hao and Zhang, Zeyu and Du, Shaoyi and Gao, Yue},
+  booktitle={International Conference on Medical Image Computing and Computer-Assisted Intervention},
+  pages={46--55},
+  year={2025},
+  organization={Springer}
 }
 ```
 

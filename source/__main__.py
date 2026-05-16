@@ -15,11 +15,11 @@ import torch
 from .utils import Logger_main
 
 
-def model_training(cfg: DictConfig):
+def model_training(cfg: DictConfig, dataloaders, fold_idx: int):
     with open_dict(cfg):
-        cfg.unique_id = datetime.now().strftime("%m-%d-%H-%M-%S")
+        cfg.fold_idx = fold_idx
+        cfg.unique_id = f"{datetime.now().strftime('%m-%d-%H-%M-%S')}-fold-{fold_idx + 1}"
 
-    dataloaders = dataset_factory(cfg)
     logger = logger_factory(cfg)
     model = model_factory(cfg)
     optimizers = optimizers_factory(
@@ -40,18 +40,18 @@ def main(cfg: DictConfig):
     auc_list = []
     sen_list = []
     spec_list = []
-    seeds = list(range(cfg.repeat_time))
     logger = Logger_main()
+    fold_dataloaders = dataset_factory(cfg)
 
-    for it in range(cfg.repeat_time):
-        SEED = seeds[it] + 1
-        logger.info(f"Fold {it + 1}/{len(seeds)}, SEED: {SEED}, device:{device}")
+    for it, dataloaders in enumerate(fold_dataloaders):
+        SEED = it + 1
+        logger.info(f"Fold {it + 1}/{len(fold_dataloaders)}, SEED: {SEED}, device:{device}")
         random.seed(SEED)  # set the random seed so that the random permutations can be reproduced again
         np.random.seed(SEED)
         torch.manual_seed(SEED)
         run = wandb.init(project=cfg.project, reinit=True,
-                         group=f"{group_name}", tags=[f"{cfg.dataset.name}"])
-        t_acc, t_auc, t_sen, t_spec = model_training(cfg)
+                         group=f"{group_name}", tags=[f"{cfg.dataset.name}", f"fold-{it + 1}"])
+        t_acc, t_auc, t_sen, t_spec = model_training(cfg, dataloaders, it)
         acc_list.append(t_acc)
         auc_list.append(t_auc)
         sen_list.append(t_sen)

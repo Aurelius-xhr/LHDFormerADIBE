@@ -1,2 +1,7 @@
 name: Train
-epochs: 50
+epochs: 100
+num_folds: 5
+validation_set: 0.1
+early_stopping_patience: 20
+early_stopping_delta: 0.0
+split_seed: 42

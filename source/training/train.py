@@ -1,4 +1,5 @@
 from source.utils import accuracy, TotalMeter, count_params, isfloat
+import copy
 import torch
 import numpy as np
 from pathlib import Path
@@ -88,19 +89,20 @@ class Train:
 
         self.model.eval()
 
-        for time_series, node_feature, label in dataloader:
-            time_series, node_feature, label = time_series.to(device), node_feature.to(device), label.to(device)
-            output, loss_pool = self.model(time_series, node_feature)
+        with torch.no_grad():
+            for time_series, node_feature, label in dataloader:
+                time_series, node_feature, label = time_series.to(device), node_feature.to(device), label.to(device)
+                output, loss_pool = self.model(time_series, node_feature)
 
-            label = label.float()
+                label = label.float()
 
-            loss = self.loss_fn(output, label)
-            loss_meter.update_with_weight(
-                loss.item(), label.shape[0])
-            top1 = accuracy(output, label[:, 1])[0]
-            acc_meter.update_with_weight(top1, label.shape[0])
-            result += F.softmax(output, dim=1)[:, 1].tolist()
-            labels += label[:, 1].tolist()
+                loss = self.loss_fn(output, label)
+                loss_meter.update_with_weight(
+                    loss.item(), label.shape[0])
+                top1 = accuracy(output, label[:, 1])[0]
+                acc_meter.update_with_weight(top1, label.shape[0])
+                result += F.softmax(output, dim=1)[:, 1].tolist()
+                labels += label[:, 1].tolist()
 
         auc = roc_auc_score(labels, result)
         result, labels = np.array(result), np.array(labels)
@@ -129,14 +131,16 @@ class Train:
             prediction, _ = self.model(time_series, node_feature)
 
             assignMat = self.model.get_assign_mat()
-            assign_np = assignMat.detach().cpu().numpy()
-            assign_matrices.append(assign_np)
+            if assignMat is not None:
+                assign_np = assignMat.detach().cpu().numpy()
+                assign_matrices.append(assign_np)
 
             attn = self.model.get_attention_weights()
-            attn_np = attn[0].detach().cpu().numpy()
+            attn_np = attn[0].detach().cpu().numpy() if attn is not None else None
             label_np = label.detach().cpu().numpy()
             labels.append(label_np)
-            attn_weights.append(attn_np)
+            if attn_np is not None:
+                attn_weights.append(attn_np)
 
 
         for time_series, node_feature, label in self.val_dataloader:
@@ -144,15 +148,17 @@ class Train:
             prediction, _ = self.model(time_series, node_feature)
 
             assignMat = self.model.get_assign_mat()
-            assign_np = assignMat.detach().cpu().numpy()
-            assign_matrices.append(assign_np)
+            if assignMat is not None:
+                assign_np = assignMat.detach().cpu().numpy()
+                assign_matrices.append(assign_np)
 
 
             attn = self.model.get_attention_weights()
-            attn_np = attn[0].detach().cpu().numpy()
+            attn_np = attn[0].detach().cpu().numpy() if attn is not None else None
             label_np = label.detach().cpu().numpy()
             labels.append(label_np)
-            attn_weights.append(attn_np)
+            if attn_np is not None:
+                attn_weights.append(attn_np)
 
         if self.save_test_attn_weights:
             attn_weights_test = []
@@ -164,20 +170,25 @@ class Train:
             prediction, _ = self.model(time_series, node_feature)
 
             assignMat = self.model.get_assign_mat()
-            assign_np = assignMat.detach().cpu().numpy()
-            assign_matrices.append(assign_np)
+            assign_np = None
+            if assignMat is not None:
+                assign_np = assignMat.detach().cpu().numpy()
+                assign_matrices.append(assign_np)
 
 
             attn = self.model.get_attention_weights()
-            attn_np = attn[0].detach().cpu().numpy()
+            attn_np = attn[0].detach().cpu().numpy() if attn is not None else None
             label_np = label.detach().cpu().numpy()
             labels.append(label_np)
-            attn_weights.append(attn_np)
+            if attn_np is not None:
+                attn_weights.append(attn_np)
 
             if self.save_test_attn_weights:
-                assign_matrices_test.append(assign_np)
+                if assign_np is not None:
+                    assign_matrices_test.append(assign_np)
                 labels_test.append(label_np)
-                attn_weights_test.append(attn_np)
+                if attn_np is not None:
+                    attn_weights_test.append(attn_np)
 
 
         np.save(self.save_path/f"attnWeights.npy", attn_weights, allow_pickle=True)
@@ -217,79 +228,90 @@ class Train:
     def train(self):
         training_process = []
         self.current_step = 0
-        best_val_AUC = 0
+        best_val_AUC = -float("inf")
         best_val_acc = 0
-        best_test_acc = 0
-        best_test_AUC = 0
-        best_test_sen = 0
-        best_test_spec = 0
+        best_epoch = -1
+        best_state_dict = None
+        epochs_without_improvement = 0
+        early_stopping_patience = int(
+            self.config.training.get("early_stopping_patience", 20))
+        early_stopping_delta = float(
+            self.config.training.get("early_stopping_delta", 0.0))
         for epoch in range(self.epochs):
             self.reset_meters()
             self.train_per_epoch(self.optimizers[0], self.lr_schedulers[0])
             val_result = self.test_per_epoch(self.val_dataloader,
                                              self.val_loss, self.val_accuracy)
 
-            test_result = self.test_per_epoch(self.test_dataloader,
-                                              self.test_loss, self.test_accuracy)
-
-            # self.logger.info(f"device:{device}")
-
             self.logger.info(" | ".join([
                 f'Epoch[{epoch}/{self.epochs}]',
                 f'Train Loss:{self.train_loss.avg: .3f}',
                 f'Val Accuracy:{self.val_accuracy.avg: .3f}',
                 f'Val AUC:{val_result[0]:.4f}',
-                f'Test Accuracy:{self.test_accuracy.avg: .3f}%',
-                f'Test AUC:{test_result[0]:.4f}',
-                f'Test Sen:{test_result[-1]:.4f}',
-                f'Test Spe:{test_result[-2]:.4f}',
-                f'Test F1:{test_result[-4]:.4f}',
                 f'LR:{self.lr_schedulers[0].lr:.5f}'
             ]))
 
             wandb.log({
                 "Train Loss": self.train_loss.avg,
-                "Test Loss": self.test_loss.avg,
-                "Test Accuracy": self.test_accuracy.avg,
-                "Test AUC": test_result[0],
                 "Val Loss": self.val_loss.avg,
                 "Val Accuracy": self.val_accuracy.avg,
                 "Val AUC": val_result[0],
-                'Test Sensitivity': test_result[-1],
-                'Test Specificity': test_result[-2],
-                'micro F1': test_result[-4],
-                'micro recall': test_result[-5],
-                'micro precision': test_result[-6],
+                "LR": self.lr_schedulers[0].lr,
+                "Epoch": epoch,
             })
 
-            if(self.test_accuracy.avg > best_test_acc):
-                best_val_acc = val_result[0]
-                best_test_acc =  self.test_accuracy.avg
-                best_test_AUC =  test_result[0]
-                best_test_sen = test_result[-1]
-                best_test_spec = test_result[-2]
-                wandb.run.summary["Best Test Accuracy"] = self.test_accuracy.avg
-                wandb.run.summary["Best Test AUC"] = test_result[0]
+            if val_result[0] > best_val_AUC + early_stopping_delta:
+                best_epoch = epoch
+                best_val_AUC = val_result[0]
+                best_val_acc = self.val_accuracy.avg
+                best_state_dict = copy.deepcopy(self.model.state_dict())
+                epochs_without_improvement = 0
                 wandb.run.summary["Best Val AUC"] = val_result[0]
                 wandb.run.summary["Best Val Accuracy"] = self.val_accuracy.avg
-                wandb.run.summary["Best Test Sensitivity"] = test_result[-1]
-                wandb.run.summary["Best Test Specificity"] = test_result[-2]
+                wandb.run.summary["Best Epoch"] = epoch
+            else:
+                epochs_without_improvement += 1
 
             training_process.append({
                 "Epoch": epoch,
                 "Train Loss": self.train_loss.avg,
                 "Train Accuracy": self.train_accuracy.avg,
-                "Test Accuracy": self.test_accuracy.avg,
-                "Test AUC": test_result[0],
-                'Test Sensitivity': test_result[-1],
-                'Test Specificity': test_result[-2],
-                'micro F1': test_result[-4],
-                'micro recall': test_result[-5],
-                'micro precision': test_result[-6],
                 "Val AUC": val_result[0],
                 "Val Loss": self.val_loss.avg,
                 "Val Accuracy": self.val_accuracy.avg,
             })
+
+            if early_stopping_patience > 0 and \
+                    epochs_without_improvement >= early_stopping_patience:
+                self.logger.info(
+                    f"Early stopping at epoch {epoch}. Best epoch: {best_epoch}, Best Val AUC: {best_val_AUC:.4f}")
+                break
+
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
+
+        self.test_loss.reset()
+        self.test_accuracy.reset()
+        test_result = self.test_per_epoch(self.test_dataloader,
+                                          self.test_loss, self.test_accuracy)
+        self.logger.info(" | ".join([
+            f'Final Test Accuracy:{self.test_accuracy.avg: .3f}%',
+            f'Final Test AUC:{test_result[0]:.4f}',
+            f'Final Test Sen:{test_result[-1]:.4f}',
+            f'Final Test Spe:{test_result[-2]:.4f}',
+            f'Best Epoch:{best_epoch}',
+        ]))
+        wandb.log({
+            "Final Test Loss": self.test_loss.avg,
+            "Final Test Accuracy": self.test_accuracy.avg,
+            "Final Test AUC": test_result[0],
+            "Final Test Sensitivity": test_result[-1],
+            "Final Test Specificity": test_result[-2],
+        })
+        wandb.run.summary["Final Test Accuracy"] = self.test_accuracy.avg
+        wandb.run.summary["Final Test AUC"] = test_result[0]
+        wandb.run.summary["Final Test Sensitivity"] = test_result[-1]
+        wandb.run.summary["Final Test Specificity"] = test_result[-2]
 
         if self.save_attn_weights:
             self.save_attention_weights()
@@ -298,4 +320,4 @@ class Train:
             self.generate_save_learnable_matrix()
 
         self.save_result(training_process)
-        return [best_test_acc,best_test_AUC,best_test_sen,best_test_spec]
+        return [self.test_accuracy.avg, test_result[0], test_result[-1], test_result[-2]]

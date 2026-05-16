@@ -1,1 +1,1 @@
-from .transformer_encoder import InterpretableTransformerEncoder
+from .transformer_encoder import InterpretableTransformerEncoder, TopologyAwareTransformerEncoder

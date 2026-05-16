@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import TransformerEncoderLayer
 from .ptdec import DEC
 from typing import List
-from .components import InterpretableTransformerEncoder
+from .components import InterpretableTransformerEncoder, TopologyAwareTransformerEncoder
 from omegaconf import DictConfig
 from ..base import BaseModel
 import pickle
@@ -22,25 +22,22 @@ def neuro_walk_embedding(data, walk_length=8, beta=0.1):
     device = data.device
     num_nodes = data.shape[0]
 
-    deg = data.sum(dim=1)
-    deg_inv = 1.0 / deg
-    deg_inv[deg_inv == float('inf')] = 0
-
-    P = data * deg_inv.view(-1, 1)
-
+    degree_inv = data.sum(dim=1).clamp(min=1e-6).reciprocal()
     fro_norm = torch.norm(data, p='fro')
-    scale = torch.sigmoid(fro_norm / torch.sqrt(torch.tensor(num_nodes, dtype=torch.float32, device=device)))
+    scale = torch.sigmoid(
+        fro_norm / torch.sqrt(torch.tensor(num_nodes, dtype=torch.float32, device=device))
+    )
 
     pe_list = [torch.eye(num_nodes, device=device)]
     current = torch.eye(num_nodes, device=device)
 
     for k in range(1, walk_length):
-        exp_term = torch.tensor(beta * (1 - k), dtype=torch.float32, device=device)
-        factor = torch.exp(exp_term) * scale
+        factor_k = torch.exp(
+            torch.tensor(beta * (1 - k), dtype=torch.float32, device=device)
+        ) * scale
+        transition_k = (factor_k * data) * degree_inv.view(-1, 1)
 
-        R_k = (factor * data) * deg_inv.view(-1, 1)
-
-        current = current @ R_k
+        current = current @ transition_k
         pe_list.append(current)
 
     pe = torch.stack(pe_list, dim=-1)
@@ -98,11 +95,14 @@ def add_every_rrwp(data,
 class TransPoolingEncoder(nn.Module):
 
     def __init__(self, input_feature_size, input_node_num, hidden_size, output_node_num, pooling=True, orthogonal=True,
-                 freeze_center=False, project_assignment=True, nHead=4, local_transformer=False):
+                 freeze_center=False, project_assignment=True, nHead=4, local_transformer=False,
+                 topology_aware=False, num_tokens=5):
         super().__init__()
-        self.transformer = InterpretableTransformerEncoder(d_model=input_feature_size, nhead=nHead,
-                                                           dim_feedforward=hidden_size,
-                                                           batch_first=True)
+        self.topology_aware = topology_aware
+        transformer_cls = TopologyAwareTransformerEncoder if topology_aware else InterpretableTransformerEncoder
+        self.transformer = transformer_cls(d_model=input_feature_size, nhead=nHead,
+                                           dim_feedforward=hidden_size,
+                                           batch_first=True)
 
         self.local_transformer = local_transformer
         if local_transformer:
@@ -125,30 +125,31 @@ class TransPoolingEncoder(nn.Module):
 
         if local_transformer:
             self.class_token = nn.ParameterList()
-            self.class_token.append(nn.Parameter(torch.Tensor(1, input_feature_size), requires_grad=True).to(device))
-            self.class_token.append(nn.Parameter(torch.Tensor(1, input_feature_size), requires_grad=True).to(device))
-            self.class_token.append(nn.Parameter(torch.Tensor(1, input_feature_size), requires_grad=True).to(device))
-            self.class_token.append(nn.Parameter(torch.Tensor(1, input_feature_size), requires_grad=True).to(device))
-            self.class_token.append(nn.Parameter(torch.Tensor(1, input_feature_size), requires_grad=True).to(device))
+            for _ in range(num_tokens):
+                self.class_token.append(
+                    nn.Parameter(torch.Tensor(1, input_feature_size), requires_grad=True).to(device))
 
         self.reset_parameters(local_transformer)
 
     def reset_parameters(self, local_transformer=False):
         if local_transformer:
             for i in range(len(self.class_token)):
-                self.class_token[i] = nn.init.xavier_normal_(self.class_token[i])
+                nn.init.xavier_normal_(self.class_token[i])
 
     def is_pooling_enabled(self):
         return self.pooling
 
     def forward(self,
-                x: torch.tensor, cluster_num=-1):
+                x: torch.tensor, cluster_num=-1, adjacency=None):
         bz, node_num, dim = x.shape
         if self.local_transformer:
             class_token = self.class_token[cluster_num]
             class_token = class_token.repeat(bz, 1, 1)
             x = torch.cat((class_token, x), dim=1)
-        x = self.transformer(x)
+        if self.topology_aware:
+            x = self.transformer(x, adjacency=adjacency)
+        else:
+            x = self.transformer(x)
         if self.local_transformer:
             cls_token = x[:, 0, :]
             x = x[:, 1:, :]
@@ -176,10 +177,9 @@ class LHDFormer(BaseModel):
         super().__init__()
 
         self.attention_list = nn.ModuleList()
-        forward_dim = config.dataset.node_sz
-
         self.pos_encoding = config.model.pos_encoding
         self.pos_embed_dim = config.model.pos_embed_dim
+        forward_dim = config.dataset.node_sz
 
         if self.pos_encoding == 'identity':
             self.node_identity = nn.Parameter(torch.zeros(
@@ -187,59 +187,38 @@ class LHDFormer(BaseModel):
             forward_dim = config.dataset.node_sz + config.model.pos_embed_dim
             nn.init.kaiming_normal_(self.node_identity)
         if self.pos_encoding == 'rrwp':
-            forward_dim = config.dataset.node_sz + config.model.pos_embed_dim
+            forward_dim = config.model.pos_embed_dim
 
-        self.num_MHSA = config.model.num_MHSA
-        sizes = config.model.sizes
-        sizes[0] = config.dataset.node_sz
-        in_sizes = [config.dataset.node_sz] + sizes[:-1]
-        do_pooling = config.model.pooling
-        self.do_pooling = do_pooling
+        self.node_sz = config.dataset.node_sz
+        self.num_windows = int(config.model.get("num_windows", 5))
+        self.total_window_nodes = self.node_sz * self.num_windows
+        self.forward_dim = forward_dim
+        self.window_threshold = float(config.model.get("window_threshold", 0.3))
+        self.thresholded = bool(config.model.get("thresholded", True))
+        self.neurowalk_beta = float(config.model.get("beta", 0.1))
+        hidden_size = int(config.model.get("hidden_size", 1024))
 
         self.local_transformer = TransPoolingEncoder(input_feature_size=forward_dim,
-                                                     input_node_num=200,
-                                                     hidden_size=1024,
-                                                     output_node_num=sizes[1],
+                                                     input_node_num=self.node_sz,
+                                                     hidden_size=hidden_size,
+                                                     output_node_num=self.node_sz,
                                                      pooling=False,
                                                      orthogonal=config.model.orthogonal,
                                                      freeze_center=config.model.freeze_center,
                                                      project_assignment=config.model.project_assignment,
                                                      nHead=config.model.nhead,
-                                                     local_transformer=True)
+                                                     local_transformer=True,
+                                                     topology_aware=True,
+                                                     num_tokens=self.num_windows)
 
-        if config.model.num_MHSA == 1:
-            self.attention_list.append(
-                TransPoolingEncoder(input_feature_size=forward_dim,
-                                    input_node_num=200,
-                                    hidden_size=1024,
-                                    output_node_num=sizes[1],
-                                    pooling=do_pooling[1],
-                                    orthogonal=config.model.orthogonal,
-                                    freeze_center=config.model.freeze_center,
-                                    project_assignment=config.model.project_assignment,
-                                    nHead=config.model.nhead,
-                                    local_transformer=False))
-        else:
-            for index, size in enumerate(sizes):
-                self.attention_list.append(
-                    TransPoolingEncoder(input_feature_size=forward_dim,
-                                        input_node_num=in_sizes[index],
-                                        hidden_size=1024,
-                                        output_node_num=size,
-                                        pooling=do_pooling[index],
-                                        orthogonal=config.model.orthogonal,
-                                        freeze_center=config.model.freeze_center,
-                                        project_assignment=config.model.project_assignment,
-                                        nHead=config.model.nhead,
-                                        local_transformer=False))
+        self.temporal_transformer = InterpretableTransformerEncoder(d_model=forward_dim,
+                                                                    nhead=config.model.nhead,
+                                                                    dim_feedforward=hidden_size,
+                                                                    batch_first=True)
 
-        self.dim_reduction = nn.Sequential(
-            nn.Linear(forward_dim, 8),
-            nn.LeakyReLU()
-        )
-
+        readout_dim = (self.num_windows + 2) * forward_dim
         self.fc = nn.Sequential(
-            nn.Linear(8 * sizes[-1], 256),
+            nn.Linear(readout_dim, 256),
             nn.LeakyReLU(),
             nn.Linear(256, 32),
             nn.LeakyReLU(),
@@ -247,22 +226,22 @@ class LHDFormer(BaseModel):
         )
 
         self.assignMat = None
-        self.mlp = nn.Sequential(
-            nn.Linear(5 * forward_dim, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, forward_dim),
-            nn.LeakyReLU()
-        )
 
-        self.mlp_feature = nn.Sequential(
-            nn.Linear(1000 * forward_dim, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, forward_dim*200),
-            nn.LeakyReLU()
-        )
-
-        self.sliding_size = [200, 400, 600, 800, 1000]
-        self.sliding = [20, 40, 60, 80, 100]
+    @staticmethod
+    def _build_window_slices(timepoints, num_windows):
+        if timepoints < num_windows:
+            raise ValueError(
+                f"Expected at least {num_windows} time points, got {timepoints}")
+        window_length = timepoints // num_windows
+        if window_length <= 1:
+            raise ValueError(
+                f"Expected each window to contain more than 1 time point, got {window_length}")
+        window_slices = []
+        for idx in range(num_windows):
+            start = idx * window_length
+            end = start + window_length
+            window_slices.append((start, end))
+        return window_slices
 
     def sliding_windows_pearson(self, tensor):
         batch_size, num_nodes, time_series_length = tensor.shape
@@ -275,6 +254,12 @@ class LHDFormer(BaseModel):
                 corr_matrix[nan_mask] = 0.000001
             corr_matrix = torch.abs(corr_matrix)
             corr_matrix = corr_matrix.fill_diagonal_(0)
+            if self.thresholded:
+                corr_matrix = torch.where(
+                    corr_matrix >= self.window_threshold,
+                    corr_matrix,
+                    torch.zeros_like(corr_matrix)
+                )
             corr_matrix = torch.round(corr_matrix * 1000) / 1000
             correlation_matrices.append(corr_matrix)
         return torch.stack(correlation_matrices)
@@ -283,83 +268,56 @@ class LHDFormer(BaseModel):
                 time_seires: torch.tensor,
                 node_feature: torch.tensor):
 
-        bz, _, _, = node_feature.shape
-        sliding_feature = torch.zeros(bz, 1000, 200).to(device)
-        sliding_feature[:, :self.sliding_size[0], :] = self.sliding_windows_pearson(time_seires[:, :, :self.sliding[0]])
-        sliding_feature[:, self.sliding_size[0]: self.sliding_size[1], :] = self.sliding_windows_pearson(time_seires[:, :, self.sliding[0]: self.sliding[1]])
-        sliding_feature[:, self.sliding_size[1]: self.sliding_size[2], :] = self.sliding_windows_pearson(time_seires[:, :, self.sliding[1]: self.sliding[2]])
-        sliding_feature[:, self.sliding_size[2]: self.sliding_size[3], :] = self.sliding_windows_pearson(time_seires[:, :, self.sliding[2]: self.sliding[3]])
-        sliding_feature[:, self.sliding_size[3]: self.sliding_size[4], :] = self.sliding_windows_pearson(time_seires[:, :, self.sliding[3]: self.sliding[4]])
+        bz, node_num, _ = node_feature.shape
+        if node_num != self.node_sz:
+            raise ValueError(f"Expected {self.node_sz} nodes, got {node_num}")
+        if time_seires.shape[1] != self.node_sz:
+            raise ValueError(
+                f"Expected time series with {self.node_sz} nodes, got {time_seires.shape[1]}"
+            )
+        window_slices = self._build_window_slices(
+            time_seires.shape[2], self.num_windows)
+        local_spatial_features = []
+        local_class_tokens = []
 
-        input_feature = torch.zeros(bz, 1000, 232).to(device)
-        if self.pos_encoding == 'identity':
-            pos_emb = self.node_identity.expand(bz, *self.node_identity.shape)
-            node_feature = torch.cat([node_feature, pos_emb], dim=-1)
+        for idx, (start_time, end_time) in enumerate(window_slices):
+            window_adj = self.sliding_windows_pearson(
+                time_seires[:, :, start_time:end_time])
 
-        if self.pos_encoding == 'rrwp':
-            pos_emb = add_full_rrwp(node_feature, self.pos_embed_dim)
-            node_feature = torch.cat([node_feature, pos_emb], dim=-1)
+            if self.pos_encoding == 'identity':
+                pos_emb = self.node_identity.expand(bz, *self.node_identity.shape)
+                window_input = torch.cat([window_adj, pos_emb], dim=-1)
+            elif self.pos_encoding == 'rrwp':
+                window_input = add_full_rrwp(
+                    window_adj, self.pos_embed_dim, beta=self.neurowalk_beta)
+            else:
+                window_input = window_adj
 
-            pos_emb0 = add_full_rrwp(sliding_feature[:, :self.sliding_size[0], :], self.pos_embed_dim)
-            pos_emb1 = add_full_rrwp(sliding_feature[:, self.sliding_size[0]: self.sliding_size[1], :], self.pos_embed_dim)
-            pos_emb2 = add_full_rrwp(sliding_feature[:, self.sliding_size[1]: self.sliding_size[2], :], self.pos_embed_dim)
-            pos_emb3 = add_full_rrwp(sliding_feature[:, self.sliding_size[2]: self.sliding_size[3], :], self.pos_embed_dim)
-            pos_emb4 = add_full_rrwp(sliding_feature[:, self.sliding_size[3]: self.sliding_size[4], :], self.pos_embed_dim)
+            window_spatial, _, local_class_token = self.local_transformer(
+                window_input, cluster_num=idx, adjacency=window_adj
+            )
+            local_spatial_features.append(window_spatial)
+            local_class_tokens.append(local_class_token)
 
-            input_feature[:, : self.sliding_size[0], :] = torch.cat([sliding_feature[:, :self.sliding_size[0], :], pos_emb0], dim=-1)
-            input_feature[:, self.sliding_size[0]: self.sliding_size[1], :] = torch.cat([sliding_feature[:, self.sliding_size[0]: self.sliding_size[1], :], pos_emb1], dim=-1)
-            input_feature[:, self.sliding_size[1]: self.sliding_size[2], :] = torch.cat([sliding_feature[:, self.sliding_size[1]: self.sliding_size[2], :], pos_emb2], dim=-1)
-            input_feature[:, self.sliding_size[2]: self.sliding_size[3], :] = torch.cat([sliding_feature[:, self.sliding_size[2]: self.sliding_size[3], :], pos_emb3], dim=-1)
-            input_feature[:, self.sliding_size[3]: self.sliding_size[4], :] = torch.cat([sliding_feature[:, self.sliding_size[3]: self.sliding_size[4], :], pos_emb4], dim=-1)
+        spatial_tokens = torch.cat(local_class_tokens, dim=1)
+        spatial_features = torch.cat(local_spatial_features, dim=1)
+        temporal_input = torch.cat([spatial_tokens, spatial_features], dim=1)
+        temporal_output = self.temporal_transformer(temporal_input)
 
-        assignments = []
-        attn_weights = []
+        token_output = temporal_output[:, :self.num_windows, :].reshape(bz, -1)
+        node_output = temporal_output[:, self.num_windows:, :]
+        mean_pool = node_output.mean(dim=1)
+        max_pool = node_output.max(dim=1).values
+        readout = torch.cat([token_output, mean_pool, max_pool], dim=-1)
 
-        input_feature[:, :self.sliding_size[0], :], _, local_class_tokens0 = self.local_transformer(
-            input_feature[:, :self.sliding_size[0], :], cluster_num=0)
-        input_feature[:, self.sliding_size[0]:self.sliding_size[1], :], _, local_class_tokens1 = self.local_transformer(
-            input_feature[:, self.sliding_size[0]:self.sliding_size[1], :], cluster_num=1)
-        input_feature[:, self.sliding_size[1]:self.sliding_size[2], :], _, local_class_tokens2 = self.local_transformer(
-            input_feature[:, self.sliding_size[1]:self.sliding_size[2], :], cluster_num=2)
-        input_feature[:, self.sliding_size[2]:self.sliding_size[3], :], _, local_class_tokens3 = self.local_transformer(
-            input_feature[:, self.sliding_size[2]:self.sliding_size[3], :], cluster_num=3)
-        input_feature[:, self.sliding_size[3]:self.sliding_size[4], :], _, local_class_tokens4 = self.local_transformer(
-            input_feature[:, self.sliding_size[3]:self.sliding_size[4], :], cluster_num=4)
-
-        # node_feature = node_feature_rearranged
-        # input_feature = input_feature.reshape((bz, -1))
-        # input_feature = self.mlp_feature(input_feature)
-        # input_feature = input_feature.reshape((bz, 200, -1))
-
-        class_token = torch.cat((local_class_tokens0, local_class_tokens1, local_class_tokens2, local_class_tokens3,
-                                 local_class_tokens4), dim=1)
-        class_token = class_token.reshape((bz, -1))
-        class_token = self.mlp(class_token)
-        class_token = class_token.reshape((bz, 1, -1))
-        node_feature = torch.cat((class_token, node_feature), dim=1)
-
-        if self.num_MHSA == 1:
-            node_feature, assign_mat, cls_token = self.attention_list[0](node_feature)
-            assignments.append(assign_mat)
-            attn_weights.append(self.attention_list[0].get_attention_weights())
-        else:
-            for atten in self.attention_list:
-                node_feature, _, cls_token = atten(node_feature)
-                attn_weights.append(atten.get_attention_weights())
-
-        self.assignMat = assignments[0]
-
-        node_feature = self.dim_reduction(node_feature)
-
-        node_feature = node_feature.reshape((bz, -1))
-
-        return self.fc(node_feature), None
+        self.assignMat = None
+        return self.fc(readout), None
 
     def get_assign_mat(self):
         return self.assignMat
 
     def get_attention_weights(self):
-        return [atten.get_attention_weights() for atten in self.attention_list]
+        return self.temporal_transformer.get_attention_weights()
 
     def get_local_attention_weights(self):
         return self.local_transformer.get_attention_weights()
@@ -370,7 +328,7 @@ class LHDFormer(BaseModel):
 
         :return: [number of clusters, hidden dimension] Tensor of dtype float
         """
-        return self.dec.get_cluster_centers()
+        return None
 
     def loss(self, assignments):
         """
@@ -378,17 +336,4 @@ class LHDFormer(BaseModel):
         Inputs: assignments: [batch size, number of clusters]
         Output: KL loss
         """
-        decs = list(
-            filter(lambda x: x.is_pooling_enabled(), self.attention_list))
-        assignments = list(filter(lambda x: x is not None, assignments))
-        loss_all = None
-
-        for index, assignment in enumerate(assignments):
-            if loss_all is None:
-                loss_all = decs[index].loss(assignment)
-            else:
-                loss_all += decs[index].loss(assignment)
-        return loss_all
-
-
-
+        return None

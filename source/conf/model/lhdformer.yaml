@@ -8,3 +8,8 @@ project_assignment: true
 pos_embed_dim: 32
 nhead: 4
 num_MHSA: 1
+num_windows: 5
+thresholded: true
+window_threshold: 0.3
+beta: 0.1
+hidden_size: 1024
